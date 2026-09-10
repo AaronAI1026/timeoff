@@ -432,6 +432,9 @@ const EMBEDDED_SCHEDULE = {
   ]
 };
 let scheduleDoc = null;      // published schedule from the shared board
+let dayCounts = {};          // shared per-day time-off counts (meta/daycounts)
+let unsubs = [];             // live subscription teardown handles
+let healT = null;
 let schedDraft = null;       // manager's in-progress textarea edits
 let schedWeekDraft = null;
 let schedEditorOpen = false;
@@ -521,8 +524,10 @@ async function init(){
       if(!auth.currentUser) await auth.signInAnonymously();
       auth.onAuthStateChanged(u => {
         if(!u){ auth.signInAnonymously().catch(()=>{}); }
+        const wasManager = isManager;
         isManager = !!(u && !u.isAnonymous);
         const chip = $("#mgrChip"); if(chip) chip.hidden = !isManager;
+        if(db && (wasManager !== isManager || u)) subscribe(); // re-scope queries for the new access level
         render();
       });
       isManager = !!(auth.currentUser && !auth.currentUser.isAnonymous);
@@ -542,17 +547,30 @@ async function init(){
 }
 
 function subscribe(){
+  unsubs.forEach(u => { try{ u(); }catch(e){} });
+  unsubs = [];
+  knownDecisionIds = null;
+  knownClaimKeys = null;
+  const uid = (!offline && auth && auth.currentUser) ? auth.currentUser.uid : null;
+  const scoped = !offline && !isManager && uid; // employees: only their own docs
+  const reqSrc = scoped ? db.collection("requests").where("ownerUid", "==", uid) : db.collection("requests");
+  const decSrc = scoped ? db.collection("decisions").where("ownerUid", "==", uid) : db.collection("decisions");
   const onErr = e => {
     if(e && e.code === "revoked") showBanner("Your access to the shared board changed. Reload the page.");
   };
-  db.collection("requests").onSnapshot(s => {
+  unsubs.push(db.collection("meta").onSnapshot(s => {
+    const d = s.docs.find(x => x.id === "daycounts");
+    dayCounts = d && d.exists ? (d.data() || {}) : {};
+    afterData();
+  }, onErr));
+  unsubs.push(reqSrc.onSnapshot(s => {
     requests = s.docs.filter(d => d.exists).map(d => ({ id: d.id, ...(d.data()||{}) }))
       .filter(r => DATE_RE.test(String(r.start)) && DATE_RE.test(String(r.end)));
     requests.sort((a,b) => String(a.start).localeCompare(String(b.start)) || String(a.createdAt||"").localeCompare(String(b.createdAt||"")));
     ready = true;
     afterData();
-  }, onErr);
-  db.collection("decisions").onSnapshot(s => {
+  }, onErr));
+  unsubs.push(decSrc.onSnapshot(s => {
     const next = {};
     s.docs.forEach(d => { if(d.exists) next[d.id] = d.data()||{}; });
     // live toast + tracked ids for the notification feed
@@ -572,13 +590,13 @@ function subscribe(){
     }
     decisions = next;
     afterData();
-  }, onErr);
-  db.collection("settings").onSnapshot(s => {
+  }, onErr));
+  unsubs.push(db.collection("settings").onSnapshot(s => {
     const d = s.docs.find(x => x.id === "schedule");
     scheduleDoc = d && d.exists ? (d.data() || null) : null;
     afterData();
-  }, onErr);
-  db.collection("shifts").onSnapshot(s => {
+  }, onErr));
+  unsubs.push(db.collection("shifts").onSnapshot(s => {
     shifts = s.docs.filter(d => d.exists).map(d => ({ id: d.id, ...(d.data()||{}) }))
       .filter(x => DATE_RE.test(String(x.date)));
     shifts.sort((a,b) => String(a.date).localeCompare(String(b.date)));
@@ -593,10 +611,39 @@ function subscribe(){
       knownClaimKeys = new Set(shifts.filter(x => x.claimedBy).map(x => x.id));
     }
     afterData();
-  }, onErr);
+  }, onErr));
 }
 
-function afterData(){ updateBadges(); render(); }
+function afterData(){ updateBadges(); render(); scheduleHeal(); }
+
+// ---------- shared per-day counts (for busy-day flags without exposing names) ----------
+function dayCountAll(ds){
+  if(isManager || offline) return dayLoad(ds).length;
+  return Math.max(dayCounts[ds] || 0, dayLoad(ds).length);
+}
+async function bumpDays(days, delta){
+  // employees keep the shared counts fresh; manager clients rebuild them exactly
+  if(offline || isManager || !days.length) return;
+  try{
+    const ref = db.doc("meta/daycounts");
+    const snap = await ref.get();
+    const m = (snap.exists && snap.data()) || {};
+    days.forEach(d => { m[d] = Math.max(0, (m[d] || 0) + delta); if(!m[d]) delete m[d]; });
+    await ref.set(m);
+  }catch(e){}
+}
+function scheduleHeal(){
+  // manager clients recompute the counts from the full data — self-corrects drift
+  if(offline || !isManager || !db || !ready) return;
+  clearTimeout(healT);
+  healT = setTimeout(async () => {
+    const m = {};
+    activeRequests().forEach(r => expandDays(r.start, r.end).forEach(d => { m[d] = (m[d] || 0) + 1; }));
+    const ka = Object.keys(m), kb = Object.keys(dayCounts);
+    const same = ka.length === kb.length && ka.every(k => m[k] === dayCounts[k]);
+    if(!same){ try{ await db.doc("meta/daycounts").set(m); }catch(e){} }
+  }, 1500);
+}
 
 // ---------- derived data ----------
 function roleOf(r){ return r.role === "Leadership" ? "Leadership" : "Budtender"; }
@@ -701,7 +748,9 @@ function viewRequestForm(){
   const f = form;
   const single = f.start && f.start === f.end;
   const days = (f.start && f.end) ? expandDays(f.start, f.end) : [];
-  const hot = days.filter(d => dayLoad(d).filter(r => r.name !== me).length >= HOT_THRESHOLD);
+  const hot = days.filter(d => (isManager || offline
+    ? dayLoad(d).filter(r => r.name !== me).length
+    : Math.max(0, dayCountAll(d) - dayLoad(d).length)) >= HOT_THRESHOLD);
   let warn = "";
   if(hot.length){
     warn = `<div class="banner warn"><span>⚠️</span><div><b>Heads up — busy day${hot.length>1?"s":""}.</b> ${
@@ -799,14 +848,17 @@ function viewCalendar(){
     const ds = dstr(d);
     const out = d.getMonth() !== calM;
     const load = dayLoad(ds);
+    const total = dayCountAll(ds);
+    const others = Math.max(0, total - load.length);
     const openShifts = shifts.filter(s => s.date === ds && !s.cancelled && !s.claimedBy);
-    const hot = load.length >= HOT_THRESHOLD;
+    const hot = total >= HOT_THRESHOLD;
     const shown = load.slice(0,3);
     const extra = load.length - shown.length;
-    cells += `<button class="day${out?" out":""}${ds===today?" today":""}${hot?" hot":""}" data-day="${ds}" aria-label="${esc(fmtDay(ds))}, ${load.length} request${load.length===1?"":"s"}">
+    cells += `<button class="day${out?" out":""}${ds===today?" today":""}${hot?" hot":""}" data-day="${ds}" aria-label="${esc(fmtDay(ds))}, ${total} request${total===1?"":"s"}">
       <span class="dn">${d.getDate()}</span>
       ${shown.map(r => `<span class="chip st-${statusOf(r)}">${esc(firstName(r.name))}${r.start===r.end && (r.dayPart==="half"||r.dayPart==="am"||r.dayPart==="pm") ? " ½" : r.start===r.end && r.dayPart==="custom" ? " ⏱" : ""}</span>`).join("")}
       ${extra > 0 ? `<span class="more">+${extra} more</span>` : ""}
+      ${others > 0 ? `<span class="chip st-pending">${others} off</span>` : ""}
       ${openShifts.length ? `<span class="chip sh">↔ ${openShifts.length} shift${openShifts.length>1?"s":""}</span>` : ""}
     </button>`;
   }
@@ -880,6 +932,11 @@ function viewSchedule(){
     <details class="past" ${schedEditorOpen ? "open" : ""} id="sc-editor">
       <summary>Update the schedule (managers)</summary>
       <div class="field" style="margin-top:12px">
+        <label for="sc-pdf">Import from the schedule PDF</label>
+        <div class="hint" style="margin-bottom:6px">Pick the weekly schedule PDF — the week and every row below fill in automatically. Check them over, then Publish.</div>
+        <input id="sc-pdf" type="file" accept=".pdf,application/pdf">
+      </div>
+      <div class="field">
         <label for="sc-week">Week starting (Sunday)</label>
         <input id="sc-week" type="date" value="${esc(schedWeekDraft != null ? schedWeekDraft : sched.weekStart)}">
       </div>
@@ -913,6 +970,101 @@ async function publishSchedule(){
   }catch(e){ dbError(e, "Couldn't publish the schedule (manager access needed)"); }
 }
 
+// ---------- schedule PDF import (pdf.js) ----------
+let pdfjsReady = null;
+function loadPdfJs(){
+  if(window.pdfjsLib) return Promise.resolve();
+  if(pdfjsReady) return pdfjsReady;
+  pdfjsReady = new Promise((res, rej) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    sc.onload = () => {
+      try{ pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"; }catch(e){}
+      res();
+    };
+    sc.onerror = () => { pdfjsReady = null; rej(new Error("pdf.js failed to load")); };
+    document.head.appendChild(sc);
+  });
+  return pdfjsReady;
+}
+async function parseSchedulePdf(buf){
+  await loadPdfJs();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const page = await pdf.getPage(1);
+  const tc = await page.getTextContent();
+  const items = tc.items
+    .map(it => ({ s: String(it.str || "").trim(), x: it.transform[4], y: it.transform[5], w: it.width || 0 }))
+    .filter(it => it.s);
+  // week start: "MM/DD/YYYY – MM/DD/YYYY"
+  let weekStart = null;
+  for(const it of items){
+    const m = it.s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s*[–—-]\s*\d{1,2}\/\d{1,2}\/\d{4}/);
+    if(m){ weekStart = m[3] + "-" + String(m[1]).padStart(2,"0") + "-" + String(m[2]).padStart(2,"0"); break; }
+  }
+  // the 7 day-column headers give us the column positions
+  const heads = items.filter(it => /^(SUN|MON|TUE|WED|THU|FRI|SAT)\b/i.test(it.s) && it.s.length <= 12)
+    .sort((a,b) => a.x - b.x).slice(0, 7);
+  if(heads.length < 7) throw new Error("day columns not found");
+  const headY = heads[0].y;
+  const centers = heads.map(h => h.x + h.w / 2);
+  const nameColEnd = centers[0] - (centers[1] - centers[0]) / 2;
+  const stopIt = items.find(it => /total\s*hours/i.test(it.s));
+  const body = items.filter(it => it.y < headY - 4 && (!stopIt || it.y > stopIt.y + 4));
+  // group into visual lines
+  body.sort((a,b) => b.y - a.y || a.x - b.x);
+  const lines = [];
+  for(const it of body){
+    const ln = lines[lines.length - 1];
+    if(ln && Math.abs(ln.y - it.y) <= 3) ln.items.push(it);
+    else lines.push({ y: it.y, items: [it] });
+  }
+  // people: name-column lines come in (name, role) pairs top-to-bottom
+  const people = [];
+  for(const ln of lines){
+    const parts = ln.items.filter(it => it.x < nameColEnd).sort((a,b) => a.x - b.x);
+    if(!parts.length) continue;
+    const txt = parts.map(p => p.s).join(" ").replace(/\s+/g, " ").trim();
+    if(!txt) continue;
+    const last = people[people.length - 1];
+    if(last && !last.role && (last.y - ln.y) <= 22){ last.role = txt; last.yBot = ln.y; }
+    else people.push({ name: txt, role: "", y: ln.y, yBot: ln.y - 10, cells: [[],[],[],[],[],[],[]] });
+  }
+  if(!people.length) throw new Error("no team members found");
+  // assign every day-column fragment to the nearest person block + column
+  const mid = p => (p.y + p.yBot) / 2;
+  for(const ln of lines){
+    for(const it of ln.items){
+      if(it.x < nameColEnd) continue;
+      const cx = it.x + it.w / 2;
+      let col = 0, bd = Infinity;
+      for(let i = 0; i < 7; i++){ const d = Math.abs(cx - centers[i]); if(d < bd){ bd = d; col = i; } }
+      let p = people[0], bp = Infinity;
+      for(const q of people){ const d = Math.abs(ln.y - mid(q)); if(d < bp){ bp = d; p = q; } }
+      p.cells[col].push({ x: it.x, s: it.s });
+    }
+  }
+  const rows = people.map(p => ({
+    name: cleanName(p.name),
+    role: cleanText(p.role, 30),
+    shifts: p.cells.map(c => cleanText(c.sort((a,b) => a.x - b.x).map(f => f.s).join(" ").replace(/\s+/g, " "), 30) || "Off")
+  })).filter(r => r.name);
+  return { weekStart, rows };
+}
+async function importSchedulePdf(file){
+  toast("Reading the PDF…");
+  try{
+    const parsed = await parseSchedulePdf(await file.arrayBuffer());
+    if(!parsed.rows.length) throw new Error("empty");
+    schedDraft = serializeSchedule(parsed);
+    if(parsed.weekStart) schedWeekDraft = parsed.weekStart;
+    schedEditorOpen = true;
+    render();
+    toast("Read " + parsed.rows.length + " people from the PDF — check the rows, then Publish.");
+  }catch(e){
+    toast("Couldn't read that PDF — paste the rows in manually instead.");
+  }
+}
+
 // ===== Tab: requests =====
 function reqCard(r, opts){
   opts = opts || {};
@@ -921,7 +1073,7 @@ function reqCard(r, opts){
   const mine = me && r.name === me;
   const canDecide = isManager && st === "pending";
   const canCancel = mine && !r.cancelled && st !== "denied" && r.end >= todayStr();
-  const hotDays = expandDays(r.start, r.end).filter(day => dayLoad(day).length >= HOT_THRESHOLD);
+  const hotDays = expandDays(r.start, r.end).filter(day => dayCountAll(day) >= HOT_THRESHOLD);
   return `
   <div class="req${mine ? " mine":""}" data-req="${esc(r.id)}">
     <div class="top">
@@ -973,10 +1125,10 @@ function viewRequests(){
   return `
   <div class="card">
     <h2>Time-off requests</h2>
-    <p class="lead">${isManager ? "You're a manager here — you can approve or deny pending requests." : "Managers review these in the order they come in."}</p>
-    <div class="filters">
+    <p class="lead">${isManager ? "You're a manager here — you can approve or deny pending requests." : "You see only your own requests — managers see the whole team's."}</p>
+    ${isManager ? `<div class="filters">
       ${fchip("all","All")}${fchip("mine","Mine")}${fchip("pending","Pending")}${fchip("approved","Approved")}${fchip("denied","Denied")}${fchip("bud","Budtenders")}${fchip("lead","Leadership")}
-    </div>
+    </div>` : ""}
     <div class="sechead"><h3>Needs a decision</h3><span class="n">${pending.length}</span></div>
     ${pending.length ? pending.map(r => reqCard(r)).join("") : `<div class="empty">Nothing waiting. 🌤</div>`}
     <div class="sechead"><h3>Upcoming</h3><span class="n">${upcoming.length}</span></div>
@@ -1097,6 +1249,10 @@ function wire(root){
   const scp = root.querySelector("#sc-publish");
   if(scp){
     scp.addEventListener("click", publishSchedule);
+    const scpdf = root.querySelector("#sc-pdf");
+    if(scpdf) scpdf.addEventListener("change", e => {
+      if(e.target.files && e.target.files[0]) importSchedulePdf(e.target.files[0]);
+    });
     root.querySelector("#sc-editor").addEventListener("toggle", e => { schedEditorOpen = e.target.open; });
     root.querySelector("#sc-text").addEventListener("input", e => { schedDraft = e.target.value; });
     root.querySelector("#sc-week").addEventListener("change", e => { schedWeekDraft = e.target.value; });
@@ -1163,11 +1319,13 @@ async function submitRequest(){
     start, end, dayPart, fromTime, toTime,
     reason: cleanText(form.reason, 300),
     createdAt: new Date().toISOString(),
-    cancelled: false
+    cancelled: false,
+    ownerUid: (!offline && auth && auth.currentUser) ? auth.currentUser.uid : "local"
   };
   const btn = $("#f-submit"); if(btn){ btn.disabled = true; btn.textContent = "Submitting…"; }
   try{
     await db.doc("requests/" + uid()).set(body);
+    bumpDays(days, +1);
     form = { type: form.type, role, start:"", end:"", dayPart:"full", fromTime:"", toTime:"", reason:"" };
     lsSet("sto.draft", form);
     toast("Request submitted ☀️ Managers have been queued.");
@@ -1183,7 +1341,7 @@ async function decide(id, kind){
   const r = requests.find(x => x.id === id); if(!r) return;
   const noteEl = document.getElementById("note-" + id);
   const note = cleanText(noteEl ? noteEl.value : "", 200);
-  const body = { status: kind === "approve" ? "approved" : "denied", note, by: me || "Manager", at: new Date().toISOString() };
+  const body = { status: kind === "approve" ? "approved" : "denied", note, by: me || "Manager", at: new Date().toISOString(), ownerUid: r.ownerUid || "" };
   try{
     openNoteFor = null;
     await db.doc("decisions/" + id).set(body);
@@ -1198,7 +1356,11 @@ async function revert(id){
 async function cancelRequest(id){
   const r = requests.find(x => x.id === id); if(!r) return;
   if(!confirm("Cancel your " + fmtRange(r) + " request?")) return;
-  try{ await db.doc("requests/" + id).update({ cancelled: true, cancelledAt: new Date().toISOString() }); toast("Request cancelled."); }
+  try{
+    await db.doc("requests/" + id).update({ cancelled: true, cancelledAt: new Date().toISOString() });
+    bumpDays(expandDays(r.start, r.end), -1);
+    toast("Request cancelled.");
+  }
   catch(e){ dbError(e, "Couldn't cancel"); }
 }
 async function postShift(){
@@ -1374,12 +1536,15 @@ function openDay(ds){
   const dayShifts = shifts.filter(s => s.date === ds && !s.cancelled);
   const active = load.filter(r => statusOf(r) !== "denied");
   const onSched = scheduledFor(ds);
+  const total = dayCountAll(ds);
+  const hiddenOthers = !isManager && !offline ? Math.max(0, total - load.length) : 0;
   sheet(`
     <h2>${esc(fmtDay(ds))}</h2>
     ${onSched && onSched.length ? `<div class="banner info" style="display:block"><b>On the schedule (${onSched.length}):</b> ${
       onSched.map(x => esc(firstName(x.name)) + " " + esc(x.cell)).join(" · ")}</div>` : ""}
-    ${active.length >= HOT_THRESHOLD ? `<div class="banner warn"><span>⚠️</span><div><b>Busy day:</b> ${active.length} time-off requests. New requests for this day may be denied for coverage.</div></div>` : ""}
-    ${load.length ? load.map(r => reqCard(r)).join("") : `<div class="empty">No time-off requests this day.</div>`}
+    ${total >= HOT_THRESHOLD ? `<div class="banner warn"><span>⚠️</span><div><b>Busy day:</b> ${total} time-off request${total===1?"":"s"}. New requests for this day may be denied for coverage.</div></div>` : ""}
+    ${hiddenOthers > 0 ? `<div class="banner info"><span>👥</span><div>${hiddenOthers} teammate${hiddenOthers===1?" has":"s have"} time off this day. Names are only visible to managers.</div></div>` : ""}
+    ${load.length ? load.map(r => reqCard(r)).join("") : `<div class="empty">${isManager || offline ? "No time-off requests this day." : "You have no requests this day."}</div>`}
     ${dayShifts.length ? `<div class="sechead"><h3>Shifts</h3></div>` + dayShifts.map(s => `
       <div class="shift"><div class="top"><span style="font-weight:700">${esc(s.name)}</span>
       <span class="pill ${s.claimedBy ? "claimed":"open"}">${s.claimedBy ? "Covered by " + esc(s.claimedBy) : "Up for grabs"}</span></div>
