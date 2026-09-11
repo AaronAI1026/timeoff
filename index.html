@@ -407,6 +407,7 @@ let reqFilter = "all";
 let lastSeen = lsGet("sto.lastSeen", 0);
 let knownDecisionIds = null;   // for live toasts
 let knownClaimKeys = null;
+let knownSwapOkIds = null;
 let openNoteFor = null;   // request id with the deny/approve note box open
 let ready = false;
 
@@ -431,16 +432,34 @@ const EMBEDDED_SCHEDULE = {
     {name:"Serena Yancey", role:"Budtender", shifts:["3:00 PM–9:30 PM","Off","8:00 AM–3:00 PM","Time Off","Time Off","Time Off","Time Off"]}
   ]
 };
-let scheduleDoc = null;      // published schedule from the shared board
+let schedules = [];          // published schedules, one per week, sorted by weekStart
+let selSchedWeek = null;     // week the viewer is looking at (null = auto)
 let dayCounts = {};          // shared per-day time-off counts (meta/daycounts)
 let unsubs = [];             // live subscription teardown handles
 let healT = null;
 let schedDraft = null;       // manager's in-progress textarea edits
 let schedWeekDraft = null;
 let schedEditorOpen = false;
+function addDaysStr(ds, n){
+  const d = parseDate(ds); if(!d) return ds;
+  d.setDate(d.getDate() + n);
+  return dstr(d);
+}
+function weekScheduleFor(ds){ // the published schedule whose week contains this date
+  return schedules.find(s => s.weekStart <= ds && ds <= addDaysStr(s.weekStart, 6)) || null;
+}
+function defaultSchedWeek(){
+  const t = todayStr();
+  const cur = weekScheduleFor(t);
+  if(cur) return cur.weekStart;
+  const up = schedules.find(s => s.weekStart > t);
+  if(up) return up.weekStart;
+  return schedules.length ? schedules[schedules.length - 1].weekStart : EMBEDDED_SCHEDULE.weekStart;
+}
 function currentSchedule(){
-  const s = scheduleDoc && Array.isArray(scheduleDoc.rows) && DATE_RE.test(String(scheduleDoc.weekStart)) ? scheduleDoc : EMBEDDED_SCHEDULE;
-  return s;
+  if(!schedules.length) return EMBEDDED_SCHEDULE;
+  const w = selSchedWeek || defaultSchedWeek();
+  return schedules.find(s => s.weekStart === w) || schedules[schedules.length - 1];
 }
 function schedCellKind(cell){
   const c = String(cell||"").trim().toLowerCase();
@@ -454,7 +473,8 @@ function serializeSchedule(s){
   ).join("\n");
 }
 function scheduledFor(ds){
-  const s = currentSchedule();
+  const s = weekScheduleFor(ds) || (!schedules.length ? EMBEDDED_SCHEDULE : null);
+  if(!s) return null;
   const ws = parseDate(s.weekStart), d = parseDate(ds);
   if(!ws || !d) return null;
   const idx = Math.round((d - ws) / 86400000);
@@ -551,6 +571,7 @@ function subscribe(){
   unsubs = [];
   knownDecisionIds = null;
   knownClaimKeys = null;
+  knownSwapOkIds = null;
   const uid = (!offline && auth && auth.currentUser) ? auth.currentUser.uid : null;
   const scoped = !offline && !isManager && uid; // employees: only their own docs
   const reqSrc = scoped ? db.collection("requests").where("ownerUid", "==", uid) : db.collection("requests");
@@ -592,8 +613,17 @@ function subscribe(){
     afterData();
   }, onErr));
   unsubs.push(db.collection("settings").onSnapshot(s => {
-    const d = s.docs.find(x => x.id === "schedule");
-    scheduleDoc = d && d.exists ? (d.data() || null) : null;
+    const byWeek = {};
+    s.docs.forEach(d => {
+      if(!d.exists) return;
+      if(d.id !== "schedule" && d.id.indexOf("schedule-") !== 0) return;
+      const data = d.data() || {};
+      if(!DATE_RE.test(String(data.weekStart)) || !Array.isArray(data.rows)) return;
+      const entry = { ...data, docId: d.id };
+      // prefer the per-week doc over the old single "schedule" doc for the same week
+      if(!byWeek[data.weekStart] || d.id !== "schedule") byWeek[data.weekStart] = entry;
+    });
+    schedules = Object.values(byWeek).sort((a,b) => String(a.weekStart).localeCompare(String(b.weekStart)));
     afterData();
   }, onErr));
   unsubs.push(db.collection("shifts").onSnapshot(s => {
@@ -609,6 +639,16 @@ function subscribe(){
       });
     }else{
       knownClaimKeys = new Set(shifts.filter(x => x.claimedBy).map(x => x.id));
+    }
+    if(knownSwapOkIds){
+      shifts.forEach(sh => {
+        if(sh.approvedBy && !knownSwapOkIds.has(sh.id) && me && (sh.name === me || sh.claimedBy === me)){
+          toast("Swap confirmed ✅ " + cleanName(sh.claimedBy) + " covers " + fmtDay(sh.date) + ".");
+        }
+        if(sh.approvedBy) knownSwapOkIds.add(sh.id);
+      });
+    }else{
+      knownSwapOkIds = new Set(shifts.filter(x => x.approvedBy).map(x => x.id));
     }
     afterData();
   }, onErr));
@@ -671,6 +711,7 @@ function feedEvents(){
   shifts.forEach(s => {
     if(s.createdAt && !s.cancelled) ev.push({ t:s.createdAt, kind:"shiftOpen", s });
     if(s.claimedAt && s.claimedBy) ev.push({ t:s.claimedAt, kind:"shiftClaimed", s });
+    if(s.approvedAt && s.approvedBy) ev.push({ t:s.approvedAt, kind:"swapOk", s });
   });
   ev.sort((a,b) => String(b.t).localeCompare(String(a.t)));
   return ev.slice(0, 40);
@@ -682,6 +723,7 @@ function unreadCount(){
     const author = e.kind === "request" ? e.r.name
       : e.kind === "shiftOpen" ? e.s.name
       : e.kind === "shiftClaimed" ? e.s.claimedBy
+      : e.kind === "swapOk" ? e.s.approvedBy
       : (e.d && e.d.by);
     return !(me && author === me);
   }).length;
@@ -896,11 +938,21 @@ function viewSchedule(){
   }
   const rows = (Array.isArray(sched.rows) ? sched.rows : []).slice(0,60);
   const weekEnd = dayHeads[6].ds;
-  const fromBoard = sched === scheduleDoc;
+  const fromBoard = !!sched.docId;
+  const idx = schedules.findIndex(s => s.weekStart === sched.weekStart);
+  const hasPrev = idx > 0, hasNext = idx >= 0 && idx < schedules.length - 1;
+  const t = todayStr();
+  const weekTag = (sched.weekStart <= t && t <= weekEnd) ? "This week"
+    : sched.weekStart === addDaysStr(t, 7 - parseDate(t).getDay()) ? "Next week" : "";
   return `
   <div class="card">
-    <h2>Team schedule</h2>
-    <p class="lead">Week of ${esc(fmtDay(sched.weekStart))} – ${esc(fmtDay(weekEnd))}</p>
+    <div class="calhead">
+      <h2>Team schedule</h2>
+      ${schedules.length > 1 ? `
+      <button class="navbtn" id="sc-prev" aria-label="Earlier week" ${hasPrev?"":"disabled"}>‹</button>
+      <button class="navbtn" id="sc-next" aria-label="Later week" ${hasNext?"":"disabled"}>›</button>` : ""}
+    </div>
+    <p class="lead" style="margin-top:2px">Week of ${esc(fmtDay(sched.weekStart))} – ${esc(fmtDay(weekEnd))}${weekTag ? ` · <b>${weekTag}</b>` : ""}${schedules.length > 1 ? ` · ${schedules.length} weeks on the board` : ""}</p>
     <div class="schedwrap">
       <table class="sched">
         <thead><tr>
@@ -922,15 +974,17 @@ function viewSchedule(){
     </div>
     <div class="schedmeta">
       ${fromBoard
-        ? `<span>Updated by ${esc(scheduleDoc.by || "a manager")} ${ago(scheduleDoc.updatedAt)}</span>`
+        ? `<span>Updated by ${esc(sched.by || "a manager")} ${ago(sched.updatedAt)}</span>`
         : `<span>From the schedule your manager uploaded for this week.</span>`}
       <span>“Time Off” cells are highlighted.</span>
+      ${isManager && fromBoard ? `<button class="linkbtn" id="sc-del">Remove this week</button>` : ""}
     </div>
   </div>
   ${isManager ? `
   <div class="card">
     <details class="past" ${schedEditorOpen ? "open" : ""} id="sc-editor">
-      <summary>Update the schedule (managers)</summary>
+      <summary>Add or update a week (managers)</summary>
+      <div class="hint" style="margin-top:8px">Each week is stored separately — publishing next week keeps this week on the board too.</div>
       <div class="field" style="margin-top:12px">
         <label for="sc-pdf">Import from the schedule PDF</label>
         <div class="hint" style="margin-bottom:6px">Pick the weekly schedule PDF — the week and every row below fill in automatically. Check them over, then Publish.</div>
@@ -963,11 +1017,22 @@ async function publishSchedule(){
   }
   if(!rows.length){ toast("Add at least one person."); return; }
   try{
-    await db.doc("settings/schedule").set({ weekStart: week, rows, updatedAt: new Date().toISOString(), by: me || "Manager" });
+    await db.doc("settings/schedule-" + week).set({ weekStart: week, rows, updatedAt: new Date().toISOString(), by: me || "Manager" });
     schedDraft = null; schedWeekDraft = null;
-    toast("Schedule published — the whole team sees it now.");
+    selSchedWeek = week;
+    toast("Week of " + fmtDay(week) + " published — the whole team sees it now.");
     render();
   }catch(e){ dbError(e, "Couldn't publish the schedule (manager access needed)"); }
+}
+async function deleteScheduleWeek(){
+  const sched = currentSchedule();
+  if(!sched.docId) return;
+  if(!confirm("Remove the week of " + fmtDay(sched.weekStart) + " from the board?")) return;
+  try{
+    await db.doc("settings/" + sched.docId).delete();
+    selSchedWeek = null;
+    toast("Week removed.");
+  }catch(e){ dbError(e, "Couldn't remove it (manager access needed)"); }
 }
 
 // ---------- schedule PDF import (pdf.js) ----------
@@ -1150,16 +1215,20 @@ function viewShifts(){
   const shiftCard = s => {
     const mineOffer = me && s.name === me;
     const canPick = me && !mineOffer && !s.claimedBy && !s.cancelled;
+    const state = !s.claimedBy ? "open" : s.approvedBy ? "confirmed" : "awaiting";
     return `<div class="shift">
       <div class="top">
         <span class="who" style="font-weight:700">${esc(s.name)}</span>
-        <span class="pill ${s.claimedBy ? "claimed" : "open"}">${s.claimedBy ? "Covered" : "Up for grabs"}</span>
+        <span class="pill ${state === "open" ? "open" : state === "confirmed" ? "claimed" : "pending"}">${
+          state === "open" ? "Up for grabs" : state === "confirmed" ? "Confirmed swap" : "Needs manager OK"}</span>
       </div>
       <div class="dates"><span class="t">${esc(fmtDay(s.date))}</span> · ${esc(fmtTime(s.startTime))}–${esc(fmtTime(s.endTime))}</div>
       ${s.note ? `<div class="reason">“${esc(s.note)}”</div>` : ""}
-      ${s.claimedBy ? `<div class="meta">Picked up by <b>${esc(s.claimedBy)}</b> ${ago(s.claimedAt)}</div>` : `<div class="meta">Posted ${ago(s.createdAt)}</div>`}
+      ${s.claimedBy ? `<div class="meta">Picked up by <b>${esc(s.claimedBy)}</b> ${ago(s.claimedAt)}${
+        s.approvedBy ? ` — confirmed by ${esc(s.approvedBy)} ${ago(s.approvedAt)}` : " — waiting on a manager"}</div>` : `<div class="meta">Posted ${ago(s.createdAt)}</div>`}
       <div class="acts">
         ${canPick ? `<button class="btn primary sm" data-pickup="${esc(s.id)}">I'll take it</button>` : ""}
+        ${isManager && state === "awaiting" ? `<button class="btn good sm" data-confirmswap="${esc(s.id)}">Confirm swap</button>` : ""}
         ${mineOffer && !s.claimedBy ? `<button class="linkbtn" data-unpost="${esc(s.id)}">Take it down</button>` : ""}
         ${isManager && s.claimedBy ? `<button class="linkbtn" data-unclaim="${esc(s.id)}">Undo pickup</button>` : ""}
       </div>
@@ -1168,7 +1237,7 @@ function viewShifts(){
   return `
   <div class="card">
     <h2>Offer up a shift</h2>
-    <p class="lead">Post a shift you can't work — a teammate can pick it up. Swaps still need a manager's OK before the schedule changes.</p>
+    <p class="lead">Post a shift you can't work — a teammate picks it up, then a manager confirms the swap right here.</p>
     <div class="grid2">
       <div class="field">
         <label for="s-date">Shift date</label>
@@ -1245,6 +1314,16 @@ function wire(root){
   root.querySelectorAll("[data-cancel]").forEach(b => b.addEventListener("click", () => cancelRequest(b.dataset.cancel)));
   const ex = root.querySelector("#exportCsv");
   if(ex) ex.addEventListener("click", exportCsv);
+  // schedule week navigation
+  const scPrev = root.querySelector("#sc-prev");
+  if(scPrev){
+    const cur = currentSchedule();
+    const idx = schedules.findIndex(s => s.weekStart === cur.weekStart);
+    scPrev.addEventListener("click", () => { if(idx > 0){ selSchedWeek = schedules[idx-1].weekStart; render(); } });
+    root.querySelector("#sc-next").addEventListener("click", () => { if(idx < schedules.length-1){ selSchedWeek = schedules[idx+1].weekStart; render(); } });
+  }
+  const scDel = root.querySelector("#sc-del");
+  if(scDel) scDel.addEventListener("click", deleteScheduleWeek);
   // schedule editor
   const scp = root.querySelector("#sc-publish");
   if(scp){
@@ -1273,6 +1352,7 @@ function wire(root){
   root.querySelectorAll("[data-pickup]").forEach(b => b.addEventListener("click", () => pickupShift(b.dataset.pickup)));
   root.querySelectorAll("[data-unpost]").forEach(b => b.addEventListener("click", () => unpostShift(b.dataset.unpost)));
   root.querySelectorAll("[data-unclaim]").forEach(b => b.addEventListener("click", () => unclaimShift(b.dataset.unclaim)));
+  root.querySelectorAll("[data-confirmswap]").forEach(b => b.addEventListener("click", () => confirmSwap(b.dataset.confirmswap)));
 }
 function focusNote(){
   const el = document.querySelector(".notebox input");
@@ -1397,8 +1477,15 @@ async function unpostShift(id){
   catch(e){ dbError(e, "Couldn't remove it"); }
 }
 async function unclaimShift(id){
-  try{ await db.doc("shifts/" + id).update({ claimedBy: "", claimedAt: "" }); toast("Pickup undone — shift is open again."); }
+  try{ await db.doc("shifts/" + id).update({ claimedBy: "", claimedAt: "", approvedBy: "", approvedAt: "" }); toast("Pickup undone — shift is open again."); }
   catch(e){ dbError(e, "Couldn't undo"); }
+}
+async function confirmSwap(id){
+  const s = shifts.find(x => x.id === id); if(!s || !s.claimedBy) return;
+  try{
+    await db.doc("shifts/" + id).update({ approvedBy: me || "Manager", approvedAt: new Date().toISOString() });
+    toast("Swap confirmed — " + firstName(s.claimedBy) + " officially covers " + fmtDay(s.date) + ".");
+  }catch(e){ dbError(e, "Couldn't confirm the swap (manager access needed)"); }
 }
 function dbError(e, what){
   const code = e && e.code;
@@ -1520,7 +1607,8 @@ function openNotifications(){
     else if(e.kind === "denied"){ ic = "❌"; cls = "denied"; txt = `<b>${esc(firstName(e.r.name))}</b>'s ${esc(fmtRange(e.r))} request was <b>denied</b>${e.d.by ? " by " + esc(e.d.by) : ""}${e.d.note ? ` — “${esc(e.d.note)}”` : ""}`; }
     else if(e.kind === "request"){ ic = "📅"; cls = "request"; txt = `<b>${esc(e.r.name)}</b> requested ${esc(e.r.type === "PTO" ? "PTO" : "unpaid time off")}: ${esc(fmtRange(e.r))}`; }
     else if(e.kind === "shiftOpen"){ ic = "↔"; cls = "shift"; txt = `<b>${esc(e.s.name)}</b> offered up their ${esc(fmtDay(e.s.date))} shift (${esc(fmtTime(e.s.startTime))}–${esc(fmtTime(e.s.endTime))})`; }
-    else if(e.kind === "shiftClaimed"){ ic = "🤝"; cls = "shift"; txt = `<b>${esc(e.s.claimedBy)}</b> picked up <b>${esc(firstName(e.s.name))}</b>'s ${esc(fmtDay(e.s.date))} shift`; }
+    else if(e.kind === "shiftClaimed"){ ic = "🤝"; cls = "shift"; txt = `<b>${esc(e.s.claimedBy)}</b> picked up <b>${esc(firstName(e.s.name))}</b>'s ${esc(fmtDay(e.s.date))} shift — waiting on a manager`; }
+    else if(e.kind === "swapOk"){ ic = "✅"; cls = "approved"; txt = `<b>${esc(e.s.approvedBy)}</b> confirmed the swap: <b>${esc(firstName(e.s.claimedBy))}</b> covers <b>${esc(firstName(e.s.name))}</b>'s ${esc(fmtDay(e.s.date))} shift`; }
     return `<div class="notif${unread ? " unread":""}"><span class="ic ${cls}">${ic}</span><div>${txt}<div class="when">${esc(ago(e.t))}</div></div></div>`;
   };
   sheet(`
